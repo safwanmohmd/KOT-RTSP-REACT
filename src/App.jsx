@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, Download, CloudUpload, RefreshCw, AlertCircle, CheckCircle, Video } from 'lucide-react';
+import { Play, Pause, Download, CloudUpload, RefreshCw, AlertCircle, CheckCircle, Video, FastForward, Zap, ClipboardPaste } from 'lucide-react';
 
 const API_URL = 'http://localhost:5000/api';
 
@@ -8,6 +8,15 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isPlayingStream, setIsPlayingStream] = useState(false);
   const [status, setStatus] = useState({ text: 'Ready', type: 'idle' });
+
+  // 1x vs 2x Extraction Mode
+  const [extractSpeed, setExtractSpeed] = useState('1x'); // '1x' or '2x'
+
+  // Live Player Speed
+  const [playerSpeed, setPlayerSpeed] = useState(1);
+
+  // Quick Paste String Input State
+  const [pastedTimeStr, setPastedTimeStr] = useState('');
 
   const [progress, setProgress] = useState({ percent: 0, currentSec: 0, totalSec: 0, speed: '0x' });
 
@@ -55,6 +64,50 @@ export default function App() {
 
   const handleChange = (e) => setForm({ ...form, [e.target.name]: e.target.value });
 
+  // Parser for pasted formats like: "2026-09-23 20:24:32.0" or "2026-09-23 20:24:32"
+  const handleApplyPastedTime = (rawInput = null) => {
+    const textToParse = (rawInput !== null ? rawInput : pastedTimeStr).trim();
+    if (!textToParse) return;
+
+    try {
+      // Clean off any trailing decimal/milliseconds like .0, .123
+      const cleaned = textToParse.replace(/\.\d+$/, '').trim();
+      // Replace space between Date and Time with 'T' if not already present
+      const isoCandidate = cleaned.includes(' ') ? cleaned.replace(' ', 'T') : cleaned;
+      
+      const parsedDate = new Date(isoCandidate);
+      if (isNaN(parsedDate.getTime())) {
+        throw new Error('Invalid date/time format');
+      }
+
+      const pad = (n) => String(n).padStart(2, '0');
+      const startFormatted = `${parsedDate.getFullYear()}-${pad(parsedDate.getMonth() + 1)}-${pad(parsedDate.getDate())}T${pad(parsedDate.getHours())}:${pad(parsedDate.getMinutes())}:${pad(parsedDate.getSeconds())}`;
+
+      // Automatically default End Time to +1 minute ahead
+      const endDate = new Date(parsedDate.getTime() + 60 * 1000);
+      const endFormatted = `${endDate.getFullYear()}-${pad(endDate.getMonth() + 1)}-${pad(endDate.getDate())}T${pad(endDate.getHours())}:${pad(endDate.getMinutes())}:${pad(endDate.getSeconds())}`;
+
+      setForm((prev) => ({
+        ...prev,
+        start_time: startFormatted,
+        end_time: endFormatted
+      }));
+
+      setStatus({ text: `Applied Start Time: ${startFormatted}`, type: 'success' });
+      setPastedTimeStr('');
+    } catch (err) {
+      alert(`Could not parse: "${textToParse}". Expected format like: 2026-09-23 20:24:32.0`);
+    }
+  };
+
+  const togglePlayerSpeed = () => {
+    const nextSpeed = playerSpeed === 1 ? 2 : 1;
+    setPlayerSpeed(nextSpeed);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = nextSpeed;
+    }
+  };
+
   const adjustTime = (seconds) => {
     if (!form.start_time) return;
     const current = new Date(form.start_time);
@@ -69,7 +122,6 @@ export default function App() {
     }
   };
 
-  // Start live/playback continuous stream in preview box
   const startLiveDVRStream = (customStartTime = null) => {
     if (!form.password) return alert('Enter DVR password first');
 
@@ -87,12 +139,13 @@ export default function App() {
 
     const url = `${API_URL}/stream?${params.toString()}`;
     setPreviewSrc(url);
-    setPreviewTitle(`Live Footage: ${mode === 'playback' ? queryTime : 'Channel ' + form.channel}`);
+    setPreviewTitle(`Footage: ${mode === 'playback' ? queryTime : 'Channel ' + form.channel}`);
     setIsPlayingStream(true);
     setStatus({ text: `Streaming from: ${mode === 'playback' ? queryTime : 'Live'}`, type: 'loading' });
 
     if (videoRef.current) {
       videoRef.current.load();
+      videoRef.current.playbackRate = playerSpeed;
       videoRef.current.play().catch(() => {});
     }
   };
@@ -103,38 +156,36 @@ export default function App() {
     setStatus({ text: 'Stream stopped.', type: 'idle' });
   };
 
-  // Extract, Auto-Play in the Preview Box, and trigger background download without jumping
   const handleDownloadVideo = async () => {
     if (!form.password) return alert('Enter DVR password');
     setLoading(true);
     setIsPlayingStream(false);
     setProgress({ percent: 0, currentSec: 0, totalSec: 0, speed: '0x' });
-    setStatus({ text: 'Extracting video...', type: 'loading' });
+    setStatus({ text: `Extracting video (${extractSpeed} speed)...`, type: 'loading' });
 
     try {
       const res = await fetch(`${API_URL}/extract`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...form, mode })
+        body: JSON.stringify({ ...form, mode, speed: extractSpeed })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
       setLastExtractedFile(data.file);
 
-      // 1. Point preview box directly to the static video file and play inside the box
       const previewFileUrl = `${API_URL}/files/${data.file}?t=${Date.now()}`;
-      setPreviewTitle(`Extracted Clip: ${data.file}`);
+      setPreviewTitle(`Extracted Clip (${extractSpeed}): ${data.file}`);
       setPreviewSrc(previewFileUrl);
 
       setTimeout(() => {
         if (videoRef.current) {
           videoRef.current.load();
+          videoRef.current.playbackRate = 1;
           videoRef.current.play().catch(() => {});
         }
       }, 100);
 
-      // 2. Trigger background download without taking over the screen
       const downloadResponse = await fetch(`${API_URL}/download/${data.file}`);
       const blob = await downloadResponse.blob();
       const blobUrl = window.URL.createObjectURL(blob);
@@ -147,7 +198,7 @@ export default function App() {
       window.URL.revokeObjectURL(blobUrl);
       document.body.removeChild(a);
 
-      setStatus({ text: `Extracted & Downloaded: ${data.file}`, type: 'success' });
+      setStatus({ text: `Extracted & Downloaded (${extractSpeed}): ${data.file}`, type: 'success' });
     } catch (err) {
       setStatus({ text: err.message, type: 'error' });
     } finally {
@@ -188,11 +239,23 @@ export default function App() {
           <span className="text-xs bg-sky-950 text-sky-400 border border-sky-800 px-2.5 py-0.5 rounded-full font-medium">Turbo Pass-through</span>
         </div>
 
-        {/* Embedded Preview Box (Never triggers fullscreen) */}
+        {/* Embedded Preview Box */}
         <div className="mb-4">
           <div className="flex justify-between items-center mb-1 text-xs text-slate-400 font-medium px-1">
             <span>{previewTitle}</span>
-            {previewSrc && <span className="text-emerald-400">Playing in container</span>}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={togglePlayerSpeed}
+                className={`px-2 py-0.5 rounded font-bold text-xs transition cursor-pointer flex items-center gap-1 ${
+                  playerSpeed === 2 ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-400' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+                title="Toggle Live Video Playback Speed"
+              >
+                <Zap className="w-3 h-3 fill-current" /> {playerSpeed}x Speed
+              </button>
+              {previewSrc && <span className="text-emerald-400">Playing</span>}
+            </div>
           </div>
           <div className="bg-black border border-slate-800 rounded-xl overflow-hidden aspect-video flex items-center justify-center relative">
             {previewSrc ? (
@@ -204,6 +267,9 @@ export default function App() {
                 muted
                 playsInline
                 disablePictureInPicture
+                onPlay={() => {
+                  if (videoRef.current) videoRef.current.playbackRate = playerSpeed;
+                }}
                 className="w-full h-full object-contain pointer-events-auto"
               />
             ) : (
@@ -247,11 +313,38 @@ export default function App() {
           )}
         </div>
 
+        {/* Extraction Speed Selector */}
+        <div className="mb-4 bg-slate-950 p-2.5 rounded-xl border border-slate-800 flex items-center justify-between">
+          <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+            <FastForward className="w-4 h-4 text-sky-400" /> Export File Speed:
+          </span>
+          <div className="flex gap-1.5">
+            <button
+              type="button"
+              onClick={() => setExtractSpeed('1x')}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition cursor-pointer ${
+                extractSpeed === '1x' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              1x Normal
+            </button>
+            <button
+              type="button"
+              onClick={() => setExtractSpeed('2x')}
+              className={`px-3 py-1 rounded-md text-xs font-bold transition cursor-pointer flex items-center gap-1 ${
+                extractSpeed === '2x' ? 'bg-amber-500 text-slate-950 font-black shadow-md shadow-amber-500/30' : 'bg-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              <Zap className="w-3 h-3 fill-current" /> 2x Fast Forward
+            </button>
+          </div>
+        </div>
+
         {/* Live Extraction Progress Bar */}
         {loading && (
           <div className="mb-4 p-3 bg-slate-950 border border-sky-900/60 rounded-xl">
             <div className="flex justify-between items-center text-xs font-semibold text-sky-400 mb-1.5">
-              <span>Extracting Video ({progress.percent}%)</span>
+              <span>Extracting Video ({progress.percent}%) [{extractSpeed} Mode]</span>
               <span>{progress.currentSec}s / {progress.totalSec}s ({progress.speed})</span>
             </div>
             <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden">
@@ -310,30 +403,58 @@ export default function App() {
           </div>
 
           {mode === 'playback' ? (
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs font-semibold text-slate-400 block mb-1">Start Time (with Secs)</label>
-                <input
-                  type="datetime-local"
-                  step="1"
-                  name="start_time"
-                  value={form.start_time}
-                  onChange={handleChange}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-white focus:border-sky-500 outline-none"
-                />
+            <>
+              {/* Quick Paste Raw Timestamp Box */}
+              <div className="bg-slate-950/80 border border-slate-800 p-2.5 rounded-xl">
+                <label className="text-xs font-semibold text-sky-400 flex items-center gap-1.5 mb-1.5">
+                  <ClipboardPaste className="w-3.5 h-3.5" /> Quick Paste Timestamp (e.g. 2026-09-23 20:24:32.0)
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={pastedTimeStr}
+                    onChange={(e) => setPastedTimeStr(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleApplyPastedTime();
+                    }}
+                    placeholder="Paste 2026-09-23 20:24:32.0 and click Apply"
+                    className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:border-sky-500 outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleApplyPastedTime()}
+                    className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition"
+                  >
+                    Apply Start Time
+                  </button>
+                </div>
               </div>
-              <div>
-                <label className="text-xs font-semibold text-slate-400 block mb-1">End Time for Clip Download</label>
-                <input
-                  type="datetime-local"
-                  step="1"
-                  name="end_time"
-                  value={form.end_time}
-                  onChange={handleChange}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-white focus:border-sky-500 outline-none"
-                />
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 block mb-1">Start Time (with Secs)</label>
+                  <input
+                    type="datetime-local"
+                    step="1"
+                    name="start_time"
+                    value={form.start_time}
+                    onChange={handleChange}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-white focus:border-sky-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 block mb-1">End Time for Clip Download</label>
+                  <input
+                    type="datetime-local"
+                    step="1"
+                    name="end_time"
+                    value={form.end_time}
+                    onChange={handleChange}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-white focus:border-sky-500 outline-none"
+                  />
+                </div>
               </div>
-            </div>
+            </>
           ) : (
             <div>
               <label className="text-xs font-semibold text-slate-400 block mb-1">Duration to Record (Seconds)</label>
@@ -342,7 +463,7 @@ export default function App() {
           )}
         </div>
 
-        {/* Action Buttons */}
+        {/* Buttons */}
         <div className="mt-5 grid grid-cols-2 gap-2">
           <button
             onClick={handleDownloadVideo}
@@ -350,7 +471,7 @@ export default function App() {
             className="flex items-center justify-center gap-2 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition cursor-pointer shadow-lg shadow-emerald-950"
           >
             {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-            Extract & Download (.MP4)
+            Extract & Download ({extractSpeed})
           </button>
 
           <button
@@ -374,4 +495,4 @@ export default function App() {
       </div>
     </div>
   );
-} 
+}

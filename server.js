@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -13,16 +13,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- Cross-Platform FFmpeg Timeout Flag Detection ---
+// FFmpeg 4.x (Ubuntu 20.04) uses -stimeout
+// FFmpeg 5.x+ (Windows modern builds) uses -timeout
+let timeoutFlag = '-timeout';
+try {
+  const check = spawnSync('ffmpeg', ['-h', 'full']);
+  const helpOutput = check.stdout ? check.stdout.toString() : '';
+  if (helpOutput.includes('-stimeout')) {
+    timeoutFlag = '-stimeout';
+  } else {
+    timeoutFlag = '-timeout';
+  }
+} catch (e) {
+  timeoutFlag = '-timeout';
+}
+console.log(`[FFMPEG] Detected RTSP timeout flag: ${timeoutFlag}`);
+
 let progressClients = [];
 
-// Helper: Format to YYYY_MM_DD_HH_MM_SS
 const formatDahuaTime = (isoString) => {
   const d = new Date(isoString);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}_${pad(d.getMonth() + 1)}_${pad(d.getDate())}_${pad(d.getHours())}_${pad(d.getMinutes())}_${pad(d.getSeconds())}`;
 };
 
-// Google Drive Client
 const getDriveClient = async () => {
   const credentialsPath = path.join(__dirname, 'credentials.json');
   const tokenPath = path.join(__dirname, 'token.json');
@@ -44,7 +59,7 @@ const getDriveClient = async () => {
   return google.drive({ version: 'v3', auth: oAuth2Client });
 };
 
-// 1. SSE Progress Endpoint
+// SSE Progress Endpoint
 app.get('/api/progress', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -65,7 +80,7 @@ const broadcastProgress = (data) => {
   });
 };
 
-// 2. Stream Live/Playback in the UI box
+// 1. Live & Playback Stream Route
 app.get('/api/stream', (req, res) => {
   const { ip = '192.168.1.175', port = '554', user = 'admin', password = '', channel = '1', mode = 'playback', start_time } = req.query;
   const encUser = encodeURIComponent(user);
@@ -88,31 +103,42 @@ app.get('/api/stream', (req, res) => {
     'Pragma': 'no-cache'
   });
 
-  const ffmpeg = spawn('ffmpeg', [
+  const ffmpegArgs = [
     '-loglevel', 'error',
     '-rtsp_transport', 'tcp',
-    '-timeout', '8000000',
-    '-fflags', '+genpts+igndts+nobuffer',
+    timeoutFlag, '5000000',
     '-i', rtspUrl,
-    '-c:v', 'copy',
-    '-tag:v', 'hvc1',
-    '-avoid_negative_ts', 'make_zero',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-tune', 'zerolatency',
+    '-pix_fmt', 'yuv420p',
     '-an',
     '-f', 'mp4',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     'pipe:1'
-  ]);
+  ];
+
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
   ffmpeg.stdout.pipe(res);
+
+  ffmpeg.stderr.on('data', (d) => {
+    console.error('Stream stderr:', d.toString());
+  });
 
   req.on('close', () => {
     ffmpeg.kill('SIGKILL');
   });
 });
 
-// 3. Extraction Endpoint
+// 2. High-Speed Extraction with 1x / 2x Speed Options
 app.post('/api/extract', (req, res) => {
-  const { ip = '192.168.1.175', port = '554', user = 'admin', password = '', channel = '1', mode = 'playback', start_time, end_time, duration = 10 } = req.body;
+  const { ip = '192.168.1.175', port = '554', user = 'admin', password = '', channel = '1', mode = 'playback', start_time, end_time, duration = 10, speed = '1x' } = req.body;
+
+  if (!password) {
+    return res.status(400).json({ error: 'DVR Password is required' });
+  }
+
   const encUser = encodeURIComponent(user);
   const encPass = encodeURIComponent(password);
 
@@ -122,7 +148,7 @@ app.post('/api/extract', (req, res) => {
 
   if (mode === 'live') {
     const stamp = Date.now();
-    outFile = `Live_Ch${channel}_${stamp}.mp4`;
+    outFile = `Live_Ch${channel}_${speed}_${stamp}.mp4`;
     rtspUrl = `rtsp://${encUser}:${encPass}@${ip}:${port}/cam/realmonitor?channel=${channel}&subtype=0`;
   } else {
     const dtStart = new Date(start_time);
@@ -135,32 +161,45 @@ app.post('/api/extract', (req, res) => {
 
     const startFmt = formatDahuaTime(start_time);
     const endFmt = formatDahuaTime(end_time);
-    outFile = `Footage_Ch${channel}_${startFmt}.mp4`;
+    outFile = `Footage_Ch${channel}_${speed}_${startFmt}.mp4`;
     rtspUrl = `rtsp://${encUser}:${encPass}@${ip}:${port}/cam/playback?channel=${channel}&subtype=0&starttime=${startFmt}&endtime=${endFmt}`;
   }
 
+  const outFilePath = path.join(__dirname, outFile);
+
   broadcastProgress({ percent: 0, currentSec: 0, totalSec: durationSec, speed: '0x' });
+
+  if (fs.existsSync(outFilePath)) {
+    fs.unlinkSync(outFilePath);
+  }
 
   const args = [
     '-y',
-    '-timeout', '10000000',
     '-rtsp_transport', 'tcp',
-    '-reorder_queue_size', '4096',
-    '-buffer_size', '10240000',
+    timeoutFlag, '5000000',
     '-fflags', '+genpts+igndts+discardcorrupt',
     '-i', rtspUrl,
-    '-t', String(durationSec),
-    '-c:v', 'copy',
-    '-tag:v', 'hvc1',
+    '-t', String(durationSec)
+  ];
+
+  if (speed === '2x') {
+    args.push('-vf', 'setpts=0.5*PTS');
+  }
+
+  args.push(
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-pix_fmt', 'yuv420p',
     '-avoid_negative_ts', 'make_zero',
     '-an',
-    '-movflags', '+faststart+frag_keyframe+empty_moov+default_base_moof',
+    '-movflags', '+faststart',
     '-progress', 'pipe:1',
-    outFile
-  ];
+    outFilePath
+  );
 
   const ffmpeg = spawn('ffmpeg', args);
   let speedValue = '1.0x';
+  let stderrLog = '';
 
   ffmpeg.stdout.on('data', (data) => {
     const lines = data.toString().split('\n');
@@ -172,7 +211,8 @@ app.post('/api/extract', (req, res) => {
         const timeUs = parseInt(line.split('=')[1].trim(), 10);
         if (!isNaN(timeUs)) {
           const currentSec = Math.floor(timeUs / 1000000);
-          const percent = Math.min(100, Math.max(0, Math.floor((currentSec / durationSec) * 100)));
+          const targetDuration = speed === '2x' ? Math.floor(durationSec / 2) : durationSec;
+          const percent = Math.min(100, Math.max(0, Math.floor((currentSec / (targetDuration || 1)) * 100)));
           broadcastProgress({
             percent,
             currentSec,
@@ -184,17 +224,30 @@ app.post('/api/extract', (req, res) => {
     });
   });
 
+  ffmpeg.stderr.on('data', (data) => {
+    stderrLog += data.toString();
+  });
+
   ffmpeg.on('close', () => {
-    if (fs.existsSync(outFile) && fs.statSync(outFile).size > 5000) {
-      broadcastProgress({ percent: 100, currentSec: durationSec, totalSec: durationSec, speed: speedValue });
-      res.json({ file: outFile });
-    } else {
-      res.status(500).json({ error: 'Extraction failed. Make sure DVR has recorded data for this range.' });
+    const fileExists = fs.existsSync(outFilePath);
+    const fileSize = fileExists ? fs.statSync(outFilePath).size : 0;
+
+    if (stderrLog.includes('401 Unauthorized') || stderrLog.includes('Connection refused')) {
+      if (fileExists) fs.unlinkSync(outFilePath);
+      return res.status(401).json({ error: 'Authentication failed. Incorrect DVR password.' });
     }
+
+    if (!fileExists || fileSize < 50000) {
+      if (fileExists) fs.unlinkSync(outFilePath);
+      return res.status(500).json({ error: 'No video stream received. Check DVR password or time range.' });
+    }
+
+    broadcastProgress({ percent: 100, currentSec: durationSec, totalSec: durationSec, speed: speedValue });
+    res.json({ file: outFile });
   });
 });
 
-// 4. Download Route with Content-Disposition (Forces Browser Download)
+// Download Route
 app.get('/api/download/:filename', (req, res) => {
   const filePath = path.join(__dirname, req.params.filename);
   if (fs.existsSync(filePath)) {
@@ -204,7 +257,7 @@ app.get('/api/download/:filename', (req, res) => {
   }
 });
 
-// 5. Normal File Serving (For In-App Preview Video Box)
+// File Serving for Preview Box
 app.get('/api/files/:filename', (req, res) => {
   const filePath = path.join(__dirname, req.params.filename);
   if (fs.existsSync(filePath)) {
@@ -214,7 +267,7 @@ app.get('/api/files/:filename', (req, res) => {
   }
 });
 
-// 6. Drive Upload
+// Drive Upload
 app.post('/api/upload_drive', async (req, res) => {
   const { filename } = req.body;
   const filePath = path.join(__dirname, filename);
